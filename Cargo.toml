@@ -1,0 +1,10 @@
+[package]
+name = "flurecon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+get_if_addrs = "0.5"
+pnet = "0.34"
+pcap = "1.1"
+etherparse = "0.13"

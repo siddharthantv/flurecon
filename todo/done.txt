@@ -1,0 +1,10 @@
+it maps local network (Layer-2 truth)
+it binds IPs to physical identities (MAC)
+it fingerprints the device 
+it detects privacy-hiding devices
+it assigns a risk level
+it captures all live traffic on your interface
+it decodes Layer-3 & Layer-4
+it correlates traffic to discovered devices
+it reveals encrypted behavior
+
