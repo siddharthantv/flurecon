@@ -67,10 +67,6 @@ fn main() {
         logger.log(&Event::Info {
             message: "Replay mode active — skipping ARP scan",
         });
-
-        let shutdown_stats  = Arc::clone(&shutdown);
-        let logger_stats    = Arc::clone(&logger);
-        let stats_stats     = Arc::clone(&stats);
         let shutdown_ctrlc2 = Arc::clone(&shutdown);
 
         // Register Ctrl+C handler before handing off to the monitor.
