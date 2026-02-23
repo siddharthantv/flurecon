@@ -1,155 +1,191 @@
+//! TCP flow state machine and per-flow anomaly detection.
+//!
+//! This module maintains per-flow TCP state and performs transport-layer
+//! anomaly detection based on packet-level observations.
+//!
+//! Changes from v0.1.0:
+//! - `println!` calls replaced with structured [`Logger`] events.
+//! - [`SharedStats`] alert counter incremented for each transport-layer alert.
+//! - Logger and stats are threaded through as parameters.
+
+use crate::logger::{Event, SharedLogger};
 use crate::monitor::config::*;
 use crate::monitor::parsers::parse_tls_sni;
 use crate::monitor::types::*;
 use etherparse::TcpHeaderSlice;
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-/// Processes a single TCP packet, updating the corresponding flow state and host profile.
+/// Processes a single TCP packet, updating the flow table and host profile.
 ///
-/// This function is the core of the TCP tracking pipeline. For each packet it:
-/// - Looks up or creates a bidirectional [`TcpFlow`] entry keyed by the canonical (sorted) endpoint pair.
-/// - Advances the flow's state machine through the standard TCP lifecycle (SYN → SYN-ACK → Established → FIN/RST).
-/// - Detects and records anomalies: slow handshakes, retransmissions, duplicate ACKs, and zero-window conditions.
-/// - Extracts the TLS SNI hostname from HTTPS payloads and forwards it to the host profile.
+/// This function:
+/// - Normalizes flow direction using a canonical key.
+/// - Advances a simplified TCP state machine.
+/// - Detects transport-layer anomalies (dup ACKs, retransmits, zero window).
+/// - Extracts TLS SNI metadata when applicable.
+/// - Updates per-flow tracking fields.
 ///
-/// # Arguments
-/// * `src`    - Source IP address of the packet as a string.
-/// * `dst`    - Destination IP address of the packet as a string.
-/// * `tcp`    - Parsed TCP header providing flags, ports, sequence/acknowledgment numbers, and window size.
-/// * `payload`- TCP payload bytes, used for TLS SNI extraction on port 443.
-/// * `now`    - Timestamp of the packet, used for RTT calculation and flow aging.
-/// * `host`   - Mutable reference to the [`HostProfile`] associated with the source, updated with
-///              SYN timing, open ports, RST counts, and TLS hostnames.
-/// * `flows`  - Shared flow table mapping [`FlowKey`]s to their [`TcpFlow`] tracking state.
+/// All alerts are emitted through the structured logger and increment
+/// the shared session statistics counter.
 pub fn process_tcp_packet(
-    src: &String,
-    dst: &String,
-    tcp: TcpHeaderSlice,
+    src:     &String,
+    dst:     &String,
+    tcp:     TcpHeaderSlice,
     payload: &[u8],
-    now: Instant,
-    host: &mut HostProfile,
-    flows: &mut HashMap<FlowKey, TcpFlow>,
+    now:     Instant,
+    host:    &mut HostProfile,
+    flows:   &mut HashMap<FlowKey, TcpFlow>,
+    logger:  &SharedLogger,
+    stats:   &SharedStats,
 ) {
-    // Build a canonical, direction-agnostic flow key by ensuring the lexicographically
-    // smaller IP always occupies the `a_ip` slot. This allows both directions of a
-    // connection to map to the same entry in the flow table.
+    // Build canonical, direction-agnostic flow key.
+    //
+    // The goal is to ensure that traffic between A→B and B→A maps
+    // to the same `FlowKey`. We normalize ordering lexicographically
+    // based on IP address, swapping endpoints when necessary.
     let mut key = FlowKey {
-        a_ip: src.clone(),
+        a_ip:   src.clone(),
         a_port: tcp.source_port(),
-        b_ip: dst.clone(),
+        b_ip:   dst.clone(),
         b_port: tcp.destination_port(),
     };
 
+    // Enforce canonical ordering to make flow lookup symmetric.
     if key.a_ip > key.b_ip {
         std::mem::swap(&mut key.a_ip, &mut key.b_ip);
         std::mem::swap(&mut key.a_port, &mut key.b_port);
     }
 
+    // Extract frequently used TCP header fields.
     let seq = tcp.sequence_number();
     let ack = tcp.acknowledgment_number();
     let win = tcp.window_size();
 
-    // Retrieve the existing flow or insert a new one initialised at the SYN state.
-    // `syn_time` is set here as a placeholder; it is overwritten when the actual SYN is processed below.
+    // Insert flow if not present, initializing with SYN state.
+    //
+    // New flows begin in `TcpState::Syn` by default and are updated
+    // as handshake packets are observed.
     let flow = flows.entry(key).or_insert(TcpFlow {
-        state: TcpState::Syn,
-        syn_time: now,
-        last_seq: seq,
-        last_ack: ack,
+        state:       TcpState::Syn,
+        syn_time:    now,
+        last_seq:    seq,
+        last_ack:    ack,
         last_window: win,
-        dup_ack: 0,
+        dup_ack:     0,
         retransmits: 0,
-        last_seen: now,
+        last_seen:   now,
     });
 
-    // ── TCP State Machine ────────────────────────────────────────────────────────
+    // ── TCP State Machine ────────────────────────────────────────────────────
+    //
+    // Simplified TCP state tracking based on observed flags.
 
-    // SYN (no ACK): the initiating side is opening a new connection.
-    // Record the timestamp for RTT measurement and track the destination port
-    // to detect port scanning behaviour on the host profile.
+    // Initial SYN (connection initiation).
     if tcp.syn() && !tcp.ack() {
-        flow.state = TcpState::Syn;
+        flow.state    = TcpState::Syn;
         flow.syn_time = now;
+
+        // Track SYN timestamps for host-level rate analysis.
         host.syn_times.push_back(now);
+
+        // Record destination port for port-scan detection.
         host.ports.insert(tcp.destination_port());
+
+        // Increment half-open connection counter.
         host.half_open += 1;
     }
 
-    // SYN-ACK: the remote side is acknowledging the connection request.
-    // Measure the round-trip time from the original SYN; flag it if it exceeds the
-    // configured `SLOW_RTT` threshold, which may indicate congestion or a distant peer.
+    // SYN-ACK response from server.
     if tcp.syn() && tcp.ack() {
         flow.state = TcpState::SynAck;
+
+        // Compute handshake RTT from initial SYN.
         let rtt = now.duration_since(flow.syn_time);
+
+        // Flag slow handshakes exceeding configured threshold.
         if rtt > SLOW_RTT {
-            println!("[SLOW HANDSHAKE] {} RTT={}ms", src, rtt.as_millis());
+            logger.log(&Event::SlowHandshake {
+                src,
+                rtt_ms: rtt.as_millis(),
+            });
+
+            stats.alerts_emitted.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    // ACK while in SYN-ACK state: the three-way handshake is complete.
-    // Decrement the half-open counter now that the connection is fully established.
+    // Final ACK completing the three-way handshake.
     if tcp.ack() && flow.state == TcpState::SynAck {
         flow.state = TcpState::Established;
+
+        // Reduce half-open count safely (avoid underflow).
         host.half_open = host.half_open.saturating_sub(1);
     }
 
-    // FIN: one side is initiating an orderly shutdown of the connection.
+    // Connection teardown via FIN.
     if tcp.fin() {
         flow.state = TcpState::Fin;
     }
 
-    // RST: the connection is being aborted unconditionally.
-    // A high RST rate on a host can indicate port scans, firewall rejections, or application errors.
+    // Abrupt termination via RST.
     if tcp.rst() {
-        flow.state = TcpState::Reset;
+        flow.state     = TcpState::Reset;
+
+        // Track reset frequency at host level.
         host.rst_count += 1;
     }
 
-    // ── Anomaly Detection ────────────────────────────────────────────────────────
+    // ── Transport Anomalies ──────────────────────────────────────────────────
+    //
+    // Detect low-level TCP anomalies often associated with congestion,
+    // packet loss, or malicious manipulation.
 
-    // Retransmission: the sender is repeating a segment with the same sequence number,
-    // indicating the original was lost or not acknowledged in time.
+    // Retransmission detection: identical sequence number observed.
     if seq == flow.last_seq {
         flow.retransmits += 1;
     }
 
-    // Duplicate ACK: the receiver is repeatedly acknowledging the same byte offset,
-    // which typically signals an out-of-order or missing segment upstream.
-    // Three or more consecutive duplicate ACKs triggers TCP fast retransmit on the sender side.
+    // Duplicate ACK detection.
     if ack == flow.last_ack {
         flow.dup_ack += 1;
+
+        // Triple duplicate ACK is a common retransmission trigger.
         if flow.dup_ack >= 3 {
-            println!("[DUP ACK] {} ack={}", src, ack);
+            logger.log(&Event::DupAck { src, ack });
+            stats.alerts_emitted.fetch_add(1, Ordering::Relaxed);
         }
     } else if ack > flow.last_ack {
-        // New data acknowledged; reset the duplicate ACK counter.
+        // Reset duplicate ACK counter on forward progress.
         flow.dup_ack = 0;
     }
 
-    // Zero-window: the receiver's buffer is full and it cannot accept more data.
-    // Sustained zero-window conditions can cause significant throughput stalls.
+    // Zero-window advertisement indicates receiver buffer exhaustion.
     if win == 0 {
-        println!("[ZERO WINDOW] {}:{}", src, tcp.source_port());
+        logger.log(&Event::ZeroWindow {
+            src,
+            port: tcp.source_port(),
+        });
+
+        stats.alerts_emitted.fetch_add(1, Ordering::Relaxed);
     }
 
-    // ── TLS SNI Extraction ───────────────────────────────────────────────────────
-
-    // For HTTPS traffic (port 443), attempt to extract the SNI hostname from the
-    // TLS ClientHello. The SNI is sent in plaintext before the encrypted handshake
-    // completes, making it available for visibility without decryption.
+    // ── TLS SNI Extraction ───────────────────────────────────────────────────
+    //
+    // If traffic involves port 443, attempt to extract TLS Server Name
+    // Indication (SNI) from ClientHello payload.
+    //
+    // This enables host-level tracking of accessed domains.
     if tcp.destination_port() == 443 || tcp.source_port() == 443 {
         if let Some(sni) = parse_tls_sni(payload) {
-            host.handle_tls(src, sni);
+            host.handle_tls(src, sni, logger);
         }
     }
 
-    // ── Update Flow Tracking State ───────────────────────────────────────────────
-
-    // Persist the current packet's fields so the next packet in this flow can
-    // detect retransmissions, duplicate ACKs, and window changes by comparison.
-    flow.last_seq = seq;
-    flow.last_ack = ack;
+    // ── Update Flow State ────────────────────────────────────────────────────
+    //
+    // Persist latest observed TCP values for next packet comparison.
+    flow.last_seq    = seq;
+    flow.last_ack    = ack;
     flow.last_window = win;
-    flow.last_seen = now;
+    flow.last_seen   = now;
 }
