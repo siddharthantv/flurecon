@@ -1,12 +1,29 @@
+//! Network monitoring engine entry point.
+//!
+//! Changes from v0.1.0:
+//! - Flow and host tables are now `Arc<Mutex<_>>` so the eviction thread can
+//!   access them concurrently without data races.
+//! - Inline `retain()` calls removed; eviction is handled by the background
+//!   thread in [`eviction`].
+//! - PCAP file replay mode added: `--read <file>` skips ARP scan and treats
+//!   all unique source IPs in the file as tracked hosts.
+//! - All `println!` replaced with structured [`Logger`] events.
+//! - [`SessionStats`] counters updated on every packet and alert.
+//! - The monitor loop polls the [`ShutdownFlag`] and exits cleanly on Ctrl+C.
+//! - Subnet mask is derived from the interface's actual prefix length rather
+//!   than being hardcoded as /24.
+
 pub mod config;
-pub mod types;
+pub mod detection;
+pub mod eviction;
 pub mod flow;
 pub mod host;
-pub mod detection;
 pub mod parsers;
+pub mod types;
 
-use crate::monitor::config::*;
+use crate::logger::{Event, SharedLogger};
 use crate::monitor::detection::detect_host_anomalies;
+use crate::monitor::eviction::{spawn_eviction_thread, SharedFlows, SharedHosts};
 use crate::monitor::flow::process_tcp_packet;
 use crate::monitor::parsers::parse_dns_name;
 use crate::monitor::types::*;
@@ -14,31 +31,65 @@ use crate::monitor::types::*;
 use etherparse::{SlicedPacket, TransportSlice};
 use pcap::Capture;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// Entry point for the network monitoring engine.
+/// Configuration bundle passed from `main` into the monitoring engine.
+pub struct MonitorConfig {
+    /// IPs to monitor. In live mode: ARP-discovered hosts. In replay mode: all
+    /// source IPs seen in the PCAP file (populated before this call).
+    pub tracked:       HashSet<String>,
+    /// Runtime-tunable detection thresholds from CLI args.
+    pub thresholds:    Thresholds,
+    /// Shared structured logger.
+    pub logger:        SharedLogger,
+    /// Shared session statistics for the shutdown summary.
+    pub stats:         SharedStats,
+    /// Set to `true` by the ctrlc handler; the loop exits on next iteration.
+    pub shutdown:      ShutdownFlag,
+    /// Path to a PCAP file for offline replay, or `None` for live capture.
+    pub pcap_file:     Option<String>,
+    /// Eviction sweep interval in seconds.
+    pub evict_interval: u64,
+}
+
+/// Entry point for the monitoring engine.
 ///
-/// Opens a live capture on the system's default network device in promiscuous mode
-/// and processes packets in a tight loop. For each packet the pipeline is:
-///
-/// 1. **Parse** the Ethernet frame and extract the IPv4 source/destination addresses.
-/// 2. **Filter** — skip packets that do not involve any address in `tracked`.
-/// 3. **Update** the source host's [`HostProfile`] with per-packet metrics.
-/// 4. **Dispatch** to protocol-specific handlers:
-///    - UDP port 53 → DNS query extraction via [`parse_dns_name`].
-///    - TCP → flow state machine and TLS SNI extraction via [`process_tcp_packet`].
-/// 5. **Detect** host-level anomalies (port scans, SYN floods, lateral movement).
-/// 6. **Evict** flows and host profiles that have exceeded their idle timeouts.
-///
-/// The function runs indefinitely until the capture device returns an error
-/// (e.g. the interface goes down or the process is interrupted).
-///
-/// # Arguments
-/// * `tracked` - Set of IP addresses whose traffic should be monitored. Packets
-///   where neither source nor destination appears in this set are silently skipped.
-pub fn start_monitor(tracked: &HashSet<String>) {
-    // Open the default pcap device in promiscuous mode so we receive all frames
-    // on the segment, not just those addressed to this machine's MAC address.
+/// Dispatches to [`run_live`] or [`run_replay`] depending on whether a PCAP
+/// file was supplied on the command line. Both paths share the same packet
+/// processing pipeline; they differ only in how packets are sourced.
+pub fn start_monitor(cfg: MonitorConfig) {
+    // Shared tables — Arc<Mutex<_>> so the eviction thread can access them.
+    let flows: SharedFlows = Arc::new(Mutex::new(HashMap::new()));
+    let hosts: SharedHosts = Arc::new(Mutex::new(HashMap::new()));
+
+    // Spawn the background eviction thread.
+    let eviction_handle = spawn_eviction_thread(
+        Arc::clone(&flows),
+        Arc::clone(&hosts),
+        cfg.evict_interval,
+        Arc::clone(&cfg.shutdown),
+    );
+
+    cfg.logger.log(&Event::Info {
+        message: "Advanced Network Analysis Engine started",
+    });
+
+    if let Some(ref path) = cfg.pcap_file {
+        run_replay(path, &cfg, &flows, &hosts);
+    } else {
+        run_live(&cfg, &flows, &hosts);
+    }
+
+    // Wait for the eviction thread to finish its final pass.
+    let _ = eviction_handle.join();
+}
+
+// ── Live capture ──────────────────────────────────────────────────────────────
+
+/// Opens a promiscuous live pcap capture and processes packets until shutdown.
+fn run_live(cfg: &MonitorConfig, flows: &SharedFlows, hosts: &SharedHosts) {
     let dev = pcap::Device::lookup()
         .expect("pcap lookup failed")
         .expect("no capture device");
@@ -49,89 +100,123 @@ pub fn start_monitor(tracked: &HashSet<String>) {
         .open()
         .unwrap();
 
-    // Two independent state tables, keyed by different granularities:
-    // - `flows` tracks individual TCP connections (identified by the 4-tuple).
-    // - `hosts` tracks aggregate behaviour per source IP across all connections.
-    // Both are evicted on a rolling timeout at the bottom of the packet loop.
-    let mut flows: HashMap<FlowKey, TcpFlow> = HashMap::new();
-    let mut hosts: HashMap<String, HostProfile> = HashMap::new();
-
-    println!("\n[+] Advanced Network Analysis Engine started\n");
-
-    while let Ok(pkt) = cap.next_packet() {
-        // Attempt to parse the raw bytes as an Ethernet II frame and walk up the
-        // layer stack. Malformed or non-Ethernet frames are silently dropped.
-        let sliced = match SlicedPacket::from_ethernet(pkt.data) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-
-        let payload = sliced.payload;
-
-        // We only handle IPv4 for now; IPv6 and non-IP frames are skipped.
-        let (src, dst) = match sliced.ip {
-            Some(etherparse::InternetSlice::Ipv4(h, _)) => (
-                h.source_addr().to_string(),
-                h.destination_addr().to_string(),
-            ),
-            _ => continue,
-        };
-
-        // Early-exit filter: ignore traffic that doesn't involve a tracked host.
-        // Checking both directions ensures we capture inbound responses as well
-        // as outbound requests from monitored addresses.
-        if !tracked.contains(&src) && !tracked.contains(&dst) {
-            continue;
+    while !cfg.shutdown.load(Ordering::Relaxed) {
+        match cap.next_packet() {
+            Ok(pkt) => process_raw(pkt.data, cfg, flows, hosts),
+            Err(_)  => break,
         }
+    }
+}
 
-        // Snapshot the current time once per packet and reuse it throughout this
-        // iteration to keep timestamps consistent across flow and host updates.
-        let now = Instant::now();
+// ── PCAP file replay ──────────────────────────────────────────────────────────
 
-        // Retrieve or create the host profile for the packet's source address.
-        // Profiles accumulate across packets, so state built up in earlier
-        // iterations (SYN counts, queried domains, etc.) is preserved here.
-        let host = hosts
-            .entry(src.clone())
-            .or_insert_with(|| HostProfile::new(now));
+/// Opens an offline PCAP file and replays every packet through the same pipeline.
+///
+/// All unique source IPs in the file are automatically added to the tracked
+/// set so that every host in the capture is analysed, even if they were not
+/// in the original ARP-discovered set (which is skipped in replay mode).
+fn run_replay(path: &str, cfg: &MonitorConfig, flows: &SharedFlows, hosts: &SharedHosts) {
+    cfg.logger.log(&Event::Info {
+        message: "Replay mode: reading from PCAP file",
+    });
 
-        // Record the destination contact and refresh `last_seen` before any
-        // protocol-specific handling, so the host is always up to date even
-        // if the transport layer handler returns early.
-        host.update_basic(&dst, now);
+    let mut cap = Capture::from_file(path).expect("Failed to open PCAP file");
 
-        match sliced.transport {
-            // DNS runs over UDP port 53. We parse the query name and hand it to
-            // the host profile, which deduplicates and logs new domains.
-            Some(TransportSlice::Udp(udp)) => {
-                if udp.destination_port() == 53 || udp.source_port() == 53 {
-                    if let Some(domain) = parse_dns_name(payload) {
-                        host.handle_dns(&src, domain);
-                    }
+    while !cfg.shutdown.load(Ordering::Relaxed) {
+        match cap.next_packet() {
+            Ok(pkt) => process_raw(pkt.data, cfg, flows, hosts),
+            Err(_)  => break, // End of file or read error
+        }
+    }
+}
+
+// ── Shared packet processing pipeline ────────────────────────────────────────
+
+/// Processes a single raw packet through the full analysis pipeline.
+///
+/// Shared between live and replay modes. Steps:
+/// 1. Parse Ethernet frame up through IP and transport layers.
+/// 2. Filter out packets not involving a tracked host.
+/// 3. Update source host profile.
+/// 4. Dispatch to protocol handler (DNS / TCP).
+/// 5. Run host-level anomaly detection.
+/// 6. Update session statistics.
+fn process_raw(
+    data:  &[u8],
+    cfg:   &MonitorConfig,
+    flows: &SharedFlows,
+    hosts: &SharedHosts,
+) {
+    let sliced = match SlicedPacket::from_ethernet(data) {
+        Ok(s)  => s,
+        Err(_) => return,
+    };
+
+    let payload = sliced.payload;
+
+    let (src, dst) = match sliced.ip {
+        Some(etherparse::InternetSlice::Ipv4(h, _)) => (
+            h.source_addr().to_string(),
+            h.destination_addr().to_string(),
+        ),
+        _ => return,
+    };
+
+    if !cfg.tracked.contains(&src) && !cfg.tracked.contains(&dst) {
+        return;
+    }
+
+    let now = Instant::now();
+
+    // Lock both tables for the duration of this packet's processing.
+    // The eviction thread uses the same mutexes; contention is expected to
+    // be low because eviction is infrequent relative to packet arrival rate.
+    let mut flows_guard = match flows.lock() {
+        Ok(g)  => g,
+        Err(_) => return,
+    };
+    let mut hosts_guard = match hosts.lock() {
+        Ok(g)  => g,
+        Err(_) => return,
+    };
+
+    let host = hosts_guard
+        .entry(src.clone())
+        .or_insert_with(|| HostProfile::new(now));
+
+    host.update_basic(&dst, now);
+
+    // Update session high-watermarks.
+    let hcount = hosts_guard.len() as u64;
+    let fcount = flows_guard.len() as u64;
+    cfg.stats.hosts_seen.fetch_max(hcount, Ordering::Relaxed);
+    cfg.stats.flows_tracked.fetch_max(fcount, Ordering::Relaxed);
+    cfg.stats.packets_total.fetch_add(1, Ordering::Relaxed);
+
+    // Reborrow host after the watermark updates.
+    let host = hosts_guard.get_mut(&src).unwrap();
+
+    match sliced.transport {
+        Some(TransportSlice::Udp(udp)) => {
+            if udp.destination_port() == 53 || udp.source_port() == 53 {
+                if let Some(domain) = parse_dns_name(payload) {
+                    host.handle_dns(&src, domain, &cfg.logger);
                 }
             }
-
-            // TCP packets are handed off to the flow processor, which maintains
-            // the per-connection state machine and handles TLS SNI extraction,
-            // retransmission detection, and handshake RTT measurement.
-            Some(TransportSlice::Tcp(tcp)) => {
-                process_tcp_packet(&src, &dst, tcp, payload, now, host, &mut flows);
-            }
-
-            // All other transport protocols (ICMP, IGMP, etc.) are not yet handled.
-            _ => {}
         }
-
-        // Run anomaly detection against the freshly updated host profile.
-        // This is intentionally called after the transport handler so that any
-        // state changes made during packet processing are visible to the detector.
-        detect_host_anomalies(&src, host, now);
-
-        // Evict entries that have been idle longer than their respective timeouts.
-        // This is done inline rather than on a timer to avoid the complexity of a
-        // separate cleanup thread, at the cost of doing a linear scan each packet.
-        // For high-throughput deployments this should be moved to a periodic task.
-        flows.retain(|_, f| f.last_seen.elapsed() < FLOW_TIMEOUT);
-        hosts.retain(|_, h| h.last_seen.elapsed() < HOST_TIMEOUT);
+        Some(TransportSlice::Tcp(tcp)) => {
+            process_tcp_packet(
+                &src, &dst, tcp, payload, now, host,
+                &mut flows_guard, &cfg.logger, &cfg.stats,
+            );
+        }
+        _ => {}
     }
+
+    detect_host_anomalies(
+        &src, host, now,
+        &cfg.thresholds,
+        &cfg.logger,
+        &cfg.stats,
+    );
 }
