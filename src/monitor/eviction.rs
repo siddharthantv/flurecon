@@ -1,43 +1,59 @@
 //! Background eviction task for the flow and host tables.
 //!
-//! In v0.1.0, `flows.retain()` and `hosts.retain()` were called inline on
-//! every packet, which meant a full linear scan of both tables ran at line
-//! rate. Under high packet volumes this added measurable latency to the hot
-//! packet path.
+//! This module implements a background thread that periodically removes stale
+//! entries from the flow and host tracking tables. Entries are considered stale
+//! if they haven't been updated within their respective timeout windows.
 //!
-//! v0.2.0 moves eviction to a dedicated thread that wakes on a configurable
-//! interval ([`Config::evict_interval`]) and performs the cleanup while the
-//! monitor thread continues processing packets. The two threads share the
-//! tables behind an `Arc<Mutex<_>>`, which is already necessary now that the
-//! eviction thread needs access.
+//! ## Concurrency Strategy
+//!
+//! The tables use `DashMap` for fine-grained locking instead of a coarse-grained
+//! `Arc<Mutex<HashMap>>`. This allows the monitor thread and eviction thread to
+//! operate concurrently with minimal contention.
+//!
+//! ## Bug 4 fix — coarse `Mutex<HashMap>` replaced with `DashMap`
+//!
+//! Previously both tables were wrapped in `Arc<Mutex<HashMap<_,_>>>`. The
+//! monitor thread held both locks for the entire duration of every packet,
+//! and the eviction thread contended for the same locks. Under high packet
+//! rates this caused measurable latency on the hot path.
+//!
+//! `DashMap` shards its internal map across multiple `RwLock`-protected
+//! buckets, so concurrent readers and the eviction thread can make progress
+//! without blocking each other on a single global lock.
 
 use crate::monitor::config::{FLOW_TIMEOUT, HOST_TIMEOUT};
 use crate::monitor::types::{FlowKey, HostProfile, ShutdownFlag, TcpFlow};
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-/// Type aliases for the shared, mutex-protected state tables.
-pub type SharedFlows = Arc<Mutex<HashMap<FlowKey, TcpFlow>>>;
-pub type SharedHosts = Arc<Mutex<HashMap<String, HostProfile>>>;
+// ── Shared table types ────────────────────────────────────────────────────────
+
+/// Shared, sharded flow table. No external `Mutex` needed.
+pub type SharedFlows = Arc<DashMap<FlowKey, TcpFlow>>;
+
+/// Shared, sharded host table. No external `Mutex` needed.
+pub type SharedHosts = Arc<DashMap<String, HostProfile>>;
+
+// ── Eviction thread ───────────────────────────────────────────────────────────
 
 /// Spawns the background eviction thread.
 ///
-/// The thread wakes every `interval` seconds, locks each table in turn,
-/// removes entries that have been idle longer than their configured timeout,
-/// and goes back to sleep. It exits cleanly when `shutdown` is set to `true`.
+/// This thread wakes every `interval` seconds to perform housekeeping on the
+/// flow and host tables. It removes entries that have exceeded their idle timeout
+/// thresholds, freeing up memory and preventing stale state accumulation.
+///
+/// The thread monitors the `shutdown` flag and performs a final eviction pass
+/// before exiting cleanly.
 ///
 /// # Arguments
-/// * `flows`    - Shared flow table, also owned by the monitor loop.
-/// * `hosts`    - Shared host table, also owned by the monitor loop.
-/// * `interval` - How often (in seconds) to run the eviction sweep.
-/// * `shutdown` - Shared flag; the thread exits when this is `true`.
 ///
-/// # Returns
-/// A [`thread::JoinHandle`] the caller can join on shutdown to ensure a final
-/// eviction pass completes before the summary is printed.
+/// * `flows` - Reference to the shared flow table
+/// * `hosts` - Reference to the shared host table
+/// * `interval` - Sleep duration in seconds between eviction passes
+/// * `shutdown` - Atomic flag signaling graceful shutdown
 pub fn spawn_eviction_thread(
     flows:    SharedFlows,
     hosts:    SharedHosts,
@@ -48,13 +64,10 @@ pub fn spawn_eviction_thread(
         let sleep_dur = Duration::from_secs(interval);
 
         loop {
-            // Sleep in 1-second increments so we can notice the shutdown flag
-            // promptly rather than waiting out the full interval.
             let mut slept = Duration::ZERO;
+            // Sleep in 1-second intervals to remain responsive to shutdown signals
             while slept < sleep_dur {
                 if shutdown.load(Ordering::Relaxed) {
-                    // Do one final eviction pass before exiting so that the
-                    // summary printed by main reflects a clean state.
                     evict(&flows, &hosts);
                     return;
                 }
@@ -69,14 +82,14 @@ pub fn spawn_eviction_thread(
 
 /// Removes idle entries from both shared tables.
 ///
-/// Each table is locked, scanned, and unlocked independently to minimise
-/// contention with the monitor thread. Flows are checked against
-/// [`FLOW_TIMEOUT`]; hosts against [`HOST_TIMEOUT`].
+/// Uses `DashMap::retain` to iterate and filter entries. Unlike a global lock,
+/// `retain` acquires per-shard write locks sequentially, allowing the monitor
+/// thread to continue processing packets in uncontended shards concurrently
+/// with eviction.
+///
+/// An entry is retained if its `last_seen` timestamp is within the configured
+/// timeout window for its respective table type.
 fn evict(flows: &SharedFlows, hosts: &SharedHosts) {
-    if let Ok(mut f) = flows.lock() {
-        f.retain(|_, flow| flow.last_seen.elapsed() < FLOW_TIMEOUT);
-    }
-    if let Ok(mut h) = hosts.lock() {
-        h.retain(|_, host| host.last_seen.elapsed() < HOST_TIMEOUT);
-    }
+    flows.retain(|_, flow| flow.last_seen.elapsed() < FLOW_TIMEOUT);
+    hosts.retain(|_, host| host.last_seen.elapsed() < HOST_TIMEOUT);
 }
