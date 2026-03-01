@@ -47,6 +47,23 @@ pub struct Cli {
     #[arg(long = "arp-timeout", value_name = "SECS", default_value_t = 3)]
     pub arp_timeout: u64,
 
+    /// Delay in milliseconds between consecutive ARP requests during the scan.
+    ///
+    /// Prevents flooding the network with a burst of ARP frames, which can
+    /// stress switches or trigger IDS alerts on monitored segments.
+    ///
+    /// Examples:
+    ///   --arp-rate 0    → no delay (original behaviour, risky on large subnets)
+    ///   --arp-rate 1    → ~1000 pkts/sec (default, safe for most LANs)
+    ///   --arp-rate 10   → ~100 pkts/sec  (conservative / cautious)
+    ///   --arp-rate 100  → ~10 pkts/sec   (very slow, large/congested networks)
+    ///
+    /// On a /24 (254 hosts) the default 1 ms adds only ~0.25 s to scan time.
+    /// On a /16 (65534 hosts) the default adds ~65 s — use a larger value or
+    /// limit scanning with --interface to a smaller subnet.
+    #[arg(long = "arp-rate", value_name = "MS", default_value_t = 1)]
+    pub arp_rate_ms: u64,
+
     // ── PCAP Replay ──────────────────────────────────────────────────────────
 
     /// Read packets from a saved PCAP file instead of a live interface.
