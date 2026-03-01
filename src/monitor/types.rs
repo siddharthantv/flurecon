@@ -1,10 +1,21 @@
 //! Core data structures shared across all monitor sub-modules.
 //!
-//! This module defines the fundamental types used for network monitoring,
-//! including session statistics, detection thresholds, flow tracking, and
-//! per-host behavioral profiles. These structures are designed to support
-//! real-time anomaly detection across multiple threat vectors including
-//! port scanning, DoS attacks, and lateral movement within networks.
+//! This module defines the fundamental types used for session tracking, threat
+//! detection thresholds, TCP flow state management, and per-host behavioral
+//! profiling. All structures are designed to be thread-safe and efficiently
+//! shared across monitor sub-modules via `Arc` pointers.
+//!
+//! # Changes in this patch:
+//! - [`HostProfile`] gains `dos_syn_times` — a second SYN deque bounded to
+//!   `DOS_WINDOW` so the DoS rate is computed over the correct 5-second window
+//!   instead of the 30-second port-scan window.
+//! - [`HostProfile`] gains per-alert `last_alert_*` `Option<Instant>` fields
+//!   that drive a per-host, per-alert-type cooldown so each alert fires at
+//!   most once per `ALERT_COOLDOWN` rather than on every packet.
+//! - [`SessionStats`] fields renamed to `total_hosts_seen` / `total_flows_tracked`
+//!   to make clear they are running totals, not high-watermarks.
+//! - [`ShutdownFlag`] type alias unchanged.
+//! - [`Thresholds`] unchanged.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -13,10 +24,10 @@ use std::time::Instant;
 
 // ── Shutdown signal ──────────────────────────────────────────────────────────
 
-/// Shared shutdown flag used to gracefully terminate the monitor loop.
+/// Shared shutdown flag used to signal graceful termination across all threads.
 ///
-/// This atomic boolean is checked periodically by the main monitoring thread
-/// to allow clean shutdown without forceful termination.
+/// When set to `true`, all monitor threads should cease processing and exit
+/// their event loops.
 pub type ShutdownFlag = Arc<AtomicBool>;
 
 // ── Alert cooldown ────────────────────────────────────────────────────────────
@@ -25,30 +36,28 @@ pub type ShutdownFlag = Arc<AtomicBool>;
 ///
 /// Without a cooldown, any threshold that has been crossed fires an alert on
 /// every subsequent packet, producing thousands of duplicate log lines per
-/// second and inflating `alerts_emitted` meaninglessly. This constant ensures
-/// each alert type fires at most once per host within this duration.
+/// second and inflating `alerts_emitted` meaninglessly.
 pub const ALERT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
 // ── Session statistics ────────────────────────────────────────────────────────
 
 /// Atomically-updated session counters accumulated throughout a monitoring run.
 ///
-/// These statistics provide high-level visibility into monitor performance and
-/// threat detection activity. All counters are thread-safe and updated without
-/// locks using atomic operations.
+/// These counters provide high-level visibility into monitor activity without
+/// requiring locks. All fields use `AtomicU64` for lock-free concurrent updates.
 pub struct SessionStats {
-    /// Total raw packets processed by the monitor loop since startup.
+    /// Total raw packets processed by the monitor loop.
     pub packets_total: AtomicU64,
-    /// Total alert events emitted to the alerts system (any severity level).
+    /// Total alert events emitted (any severity).
     pub alerts_emitted: AtomicU64,
-    /// Running total of distinct hosts ever seen (incremented on first discovery).
+    /// Running total of distinct hosts ever seen (incremented on first sight).
     pub total_hosts_seen: AtomicU64,
-    /// Running total of distinct flows ever tracked (incremented on flow creation).
+    /// Running total of distinct flows ever tracked (incremented on creation).
     pub total_flows_tracked: AtomicU64,
 }
 
 impl SessionStats {
-    /// Creates a new session statistics tracker wrapped in an `Arc` for shared ownership.
+    /// Constructs a new [`SessionStats`] with all counters initialized to zero.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             packets_total:       AtomicU64::new(0),
@@ -59,25 +68,24 @@ impl SessionStats {
     }
 }
 
-/// Shared type alias for thread-safe access to session statistics.
+/// Shared type alias for the session statistics.
 pub type SharedStats = Arc<SessionStats>;
 
 // ── Detection thresholds ──────────────────────────────────────────────────────
 
-/// Configurable sensitivity thresholds for various anomaly detection algorithms.
+/// Detection thresholds for various threat types.
 ///
-/// These thresholds control when alerts are triggered for different threat
-/// categories. Lower values produce more sensitive detection but increase
-/// false-positive rates.
+/// These values determine when anomalies cross from normal behavior into
+/// suspicious territory and trigger alerts.
 #[derive(Debug, Clone)]
 pub struct Thresholds {
-    /// Maximum number of distinct destination ports before triggering a port-scan alert.
+    /// Maximum number of distinct destination ports before a port-scan alert fires.
     pub port_scan: usize,
-    /// Maximum number of SYN packets per second before triggering a DoS alert.
+    /// Maximum SYN rate (packets/second) over the 5-second window before a DoS alert fires.
     pub dos_syn_rate: f32,
-    /// Maximum number of half-open connections before triggering a DoS alert.
+    /// Maximum number of half-open connections before a half-open connection alert fires.
     pub dos_half_open: u32,
-    /// Maximum number of distinct internal targets before triggering a lateral-movement alert.
+    /// Maximum number of distinct internal IPs contacted before a lateral-movement alert fires.
     pub lateral: usize,
 }
 
@@ -94,10 +102,10 @@ impl Default for Thresholds {
 
 // ── Flow key ─────────────────────────────────────────────────────────────────
 
-/// Unique identifier for a network flow using bidirectional socket information.
+/// Unique identifier for a bidirectional TCP flow.
 ///
-/// A flow is identified by two endpoints (IP, port) pairs and is used as a key
-/// in hash maps to track TCP connections and their state machines.
+/// Identifies a connection by the two endpoints (IP:port pairs) regardless of
+/// direction. Used as a key in flow tracking maps.
 #[derive(Hash, Eq, PartialEq, Debug, Clone)]
 pub struct FlowKey {
     pub a_ip:   String,
@@ -108,78 +116,72 @@ pub struct FlowKey {
 
 // ── TCP state machine ─────────────────────────────────────────────────────────
 
-/// TCP connection state for tracking during the Three-Way Handshake and beyond.
+/// TCP connection state observed during packet processing.
 ///
-/// Used to reconstruct connection lifecycle for anomaly correlation and to
-/// identify suspicious patterns like repeated half-open connections.
+/// Tracks the progression of a connection through its lifecycle, used to
+/// identify suspicious patterns such as half-open connections or abnormal
+/// termination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpState {
-    /// SYN packet received (connection initiating).
+    /// SYN received from initiator.
     Syn,
-    /// SYN-ACK packet received (peer responding).
+    /// SYN-ACK received from responder.
     SynAck,
-    /// Data exchange phase (fully established).
+    /// Connection established (ACK received post-SYN-ACK).
     Established,
-    /// FIN packet received (graceful close initiated).
+    /// FIN received (graceful termination).
     Fin,
-    /// RST packet received (abrupt termination).
+    /// RST received (abrupt termination).
     Reset,
 }
 
 // ── Per-flow tracking state ───────────────────────────────────────────────────
 
-/// Per-connection TCP state and sequence tracking for a single flow.
+/// Per-flow TCP connection state and metrics.
 ///
-/// Maintains the state machine progression and TCP feedback metrics
-/// (sequence numbers, window size, duplicate ACKs) to detect retransmissions,
-/// out-of-order delivery, and other transport-layer anomalies.
+/// Maintains detailed packet-level information for a single flow to detect
+/// anomalies such as retransmissions, duplicate ACKs, and zero-window conditions.
 pub struct TcpFlow {
-    /// Current state of the connection in the TCP state machine.
-    pub state:       TcpState,
+    /// Current state of the TCP connection state machine.
+    pub state: TcpState,
     /// Timestamp when the SYN packet for this flow was first observed.
-    pub syn_time:    Instant,
-    /// Last seen sequence number from the initiator.
-    pub last_seq:    u32,
-    /// Last seen acknowledgment number from the peer.
-    pub last_ack:    u32,
-    /// Last advertised TCP receive window size.
+    pub syn_time: Instant,
+    /// Last observed sequence number from the initiator.
+    pub last_seq: u32,
+    /// Last observed acknowledgment number from the responder.
+    pub last_ack: u32,
+    /// Last observed receive window size from the responder.
     pub last_window: u16,
-    /// Count of duplicate ACKs received (indicates packet loss or reordering).
-    pub dup_ack:     u32,
-    /// Count of retransmitted segments detected.
+    /// Count of duplicate ACKs received.
+    pub dup_ack: u32,
+    /// Count of detected retransmissions.
     pub retransmits: u32,
-    /// Most recent packet timestamp for this flow (used for flow timeout detection).
-    pub last_seen:   Instant,
+    /// Most recent timestamp this flow was active.
+    pub last_seen: Instant,
 }
 
 // ── Per-host behavioural profile ──────────────────────────────────────────────
 
-/// Aggregated behavioral profile for a single observed source IP.
+/// Aggregated behavioral data for a single observed source IP.
 ///
-/// This structure accumulates traffic patterns, connection attempts, and
-/// temporal metadata on a per-host basis. The profile is used to correlate
-/// multiple packets into higher-level threat signals (port scanning, DoS
-/// attacks, lateral movement, etc.).
+/// Tracks connection patterns, DNS/TLS activity, and alert history to detect
+/// scanning, denial-of-service, and lateral-movement attacks from a single host.
 pub struct HostProfile {
     /// Sliding window of SYN timestamps bounded to `PORT_SCAN_WINDOW` (30 s).
-    ///
-    /// Used to maintain the port-scan alert window. Older SYN times are
-    /// discarded after 30 seconds to prevent indefinite memory growth.
+    /// Used only for port-scan window maintenance — NOT for DoS rate.
     pub syn_times: VecDeque<Instant>,
 
     /// Sliding window of SYN timestamps bounded to `DOS_WINDOW` (5 s).
     ///
-    /// Kept separate from `syn_times` so the DoS SYN-rate denominator uses
-    /// the correct 5-second window. Previously both windows used `syn_times`
-    /// bounded to 30 s while the rate was divided by 5 s, inflating the
-    /// computed rate by 6×. This corrects that issue.
+    /// Kept separate from `syn_times` so the DoS SYN-rate denominator is the
+    /// correct 5-second window. Previously `syn_times` was bounded to 30 s
+    /// while the rate was divided by 5 s, inflating the computed rate 6×.
     pub dos_syn_times: VecDeque<Instant>,
 
     /// Destination ports contacted within the current port-scan window.
     ///
     /// Cleared when the window is reset after a port-scan alert fires (or when
     /// all SYN timestamps age out of `syn_times`), so it does not grow forever.
-    /// Each unique port increments the port-scan counter.
     pub ports: HashSet<u16>,
 
     /// Distinct internal IPs contacted; used for lateral-movement detection.
@@ -188,38 +190,40 @@ pub struct HostProfile {
     /// re-fire on every subsequent packet once the threshold is crossed.
     pub targets: HashSet<String>,
 
-    /// Domain names queried via DNS from this host.
+    /// Domain names queried by this host.
     pub dns_queries: HashSet<String>,
-    /// TLS SNI hostnames for which this host initiated encrypted connections.
+    /// TLS SNI values presented by this host.
     pub tls_sni: HashSet<String>,
-    /// Count of half-open connections (SYN without completion).
+    /// Count of half-open TCP connections (SYN sent, no SYN-ACK received).
     pub half_open: u32,
-    /// Count of reset packets sent by or to this host.
+    /// Count of TCP RST packets received.
     pub rst_count: u32,
-    /// Total packet count from this host (used for traffic volume assessment).
+    /// Total number of packets seen from this host.
     pub packet_count: u64,
-    /// Most recent packet timestamp from this host.
+    /// Most recent timestamp this host was active.
     pub last_seen: Instant,
 
     // ── Per-alert cooldown timestamps ─────────────────────────────────────────
-    // Each field records the last time a specific alert type was emitted for
-    // this host. `None` indicates the alert has never fired. The anomaly
-    // detector skips re-alerting until at least `ALERT_COOLDOWN` has elapsed,
-    // preventing alert spam while allowing re-alerts after sufficient time.
+    // Each field records when that alert type last fired for this host.
+    // `None` means the alert has never fired. `detect_host_anomalies` skips
+    // re-alerting until at least `ALERT_COOLDOWN` has elapsed.
 
-    /// Last time a port-scan alert was emitted for this host.
+    /// Timestamp of the last port-scan alert for this host.
     pub last_alert_port_scan: Option<Instant>,
-    /// Last time a DoS alert was emitted for this host.
+    /// Timestamp of the last DoS alert for this host.
     pub last_alert_dos: Option<Instant>,
-    /// Last time a lateral-movement alert was emitted for this host.
+    /// Timestamp of the last lateral-movement alert for this host.
     pub last_alert_lateral: Option<Instant>,
+
+    /// Destination ports for which a ZERO WINDOW alert has already fired from
+    /// this source. Keyed on the destination port (the port being probed) so
+    /// that one alert fires per unique port regardless of how many flows nmap
+    /// or another scanner creates toward that port.
+    pub zero_window_ports: HashSet<u16>,
 }
 
 impl HostProfile {
-    /// Creates a new behavioral profile for a newly discovered host.
-    ///
-    /// Initializes all collections as empty and sets the discovery timestamp
-    /// to the provided `now` value. Alert cooldown timers start as `None`.
+    /// Constructs a new [`HostProfile`] initialized to the given time.
     pub fn new(now: Instant) -> Self {
         Self {
             syn_times:     VecDeque::new(),
@@ -236,6 +240,7 @@ impl HostProfile {
             last_alert_port_scan: None,
             last_alert_dos:       None,
             last_alert_lateral:   None,
+            zero_window_ports:    HashSet::new(),
         }
     }
 }
