@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Represents a discovered device on the network.
+/// Represents a discovered network device with its metadata.
 struct Device {
     ip:     String,
     mac:    String,
@@ -28,29 +28,27 @@ struct Device {
 }
 
 fn main() {
-    // Parse command-line arguments
+    // ── Parse CLI arguments ───────────────────────────────────────────────────
     let cli = Cli::parse();
 
-    // Initialize shutdown flag for graceful termination
+    // ── Initialize shutdown signal ────────────────────────────────────────────
     let shutdown: ShutdownFlag = Arc::new(AtomicBool::new(false));
     let shutdown_ctrlc = Arc::clone(&shutdown);
 
-    // Track session duration for summary reporting
     let session_start = Instant::now();
 
-    // Initialize logger with optional JSON output and file logging
+    // ── Initialize logger ─────────────────────────────────────────────────────
     let logger = Arc::new(
         Logger::new(cli.json, cli.log_file.as_deref())
             .expect("Failed to open log file"),
     );
 
-    // Create session statistics tracker
+    // ── Initialize session statistics ─────────────────────────────────────────
     let stats = SessionStats::new();
 
-    // ── OUI database ─────────────────────────────────────────────────────────
-    // Load IEEE OUI (Organizationally Unique Identifier) database for vendor
-    // lookup. Bug 6 fix: load_oui_db now returns Result; log a warning and
-    // continue with an empty map rather than panicking if the file is missing.
+    // ── Load OUI database ─────────────────────────────────────────────────────
+    // Bug 6 fix: load_oui_db now returns Result; log a warning and continue
+    // with an empty map rather than panicking if the file is missing.
     logger.log(&Event::Info { message: "Loading OUI database..." });
     let oui_db = match load_oui_db() {
         Ok(db) => {
@@ -70,8 +68,9 @@ fn main() {
         }
     };
 
-    // ── PCAP replay mode ──────────────────────────────────────────────────────
-    // If a PCAP file is provided, skip live ARP scanning and replay from file
+    // ── Handle PCAP replay mode ───────────────────────────────────────────────
+    // If a PCAP file was provided, skip ARP scanning and go straight to
+    // packet analysis from the recorded file.
     if cli.pcap_file.is_some() {
         logger.log(&Event::Info {
             message: "Replay mode active — skipping ARP scan",
@@ -99,9 +98,10 @@ fn main() {
         return;
     }
 
-    // ── Interface selection ───────────────────────────────────────────────────
-    // Enumerate available network interfaces and select the target interface
-    // for ARP scanning. Filter out loopback and link-local addresses.
+    // ── Select network interface ──────────────────────────────────────────────
+    // Iterate through available interfaces and select the first usable IPv4
+    // (non-loopback, non-link-local). If --interface flag is set, filter to
+    // that specific interface only.
     let ifaces = get_if_addrs().unwrap();
     let mut my_ip:         Option<Ipv4Addr> = None;
     let mut my_iface_name: Option<String>   = None;
@@ -133,7 +133,8 @@ fn main() {
     });
     logger.log(&Event::Info { message: &format!("Interface: {}", iface_name) });
 
-    // Resolve the network interface handle for packet transmission/reception
+    // ── Open datalink channel ─────────────────────────────────────────────────
+    // Establish raw Ethernet frames for ARP request/reply processing.
     let interfaces = datalink::interfaces();
     let interface  = interfaces
         .into_iter()
@@ -143,25 +144,42 @@ fn main() {
     let my_mac = interface.mac.unwrap();
     logger.log(&Event::Info { message: &format!("MAC: {}", my_mac) });
 
-    // Open datalink channel for raw packet I/O
     let (mut tx, mut rx) = match datalink::channel(&interface, Default::default()) {
         Ok(Ethernet(tx, rx)) => (tx, rx),
         _ => panic!("Failed to open datalink channel"),
     };
 
-    // ── ARP scan ──────────────────────────────────────────────────────────────
-    // Perform active ARP scanning across the local subnet to discover hosts.
-    // Derives target IP list from network address and prefix, then sends
-    // ARP requests with configurable rate-limiting to avoid network flooding.
+    // ── Perform ARP scan ──────────────────────────────────────────────────────
+    // Generate target IP addresses for the subnet and send ARP requests to
+    // discover active hosts. Rate-limit packet transmission based on subnet size.
     logger.log(&Event::Info { message: "Scanning LAN..." });
     let scan_targets = derive_scan_targets(my_ip, my_prefix_len);
-    let arp_rate_delay = Duration::from_millis(cli.arp_rate_ms);
+    
+    // For large subnets, 1ms × 65534 hosts = ~65 seconds of sleep alone.
+    // Auto-scale: if the user didn't explicitly set --arp-rate and the subnet
+    // is larger than /24, use 0ms (burst) since the network round-trip and
+    // socket overhead already provides natural pacing at ~5000–10000 pkt/s.
+    // Users can always set --arp-rate explicitly to override.
+    let effective_rate_ms = if cli.arp_rate_ms == 1 && scan_targets.len() > 254 {
+        // Default was not overridden and subnet is large: use burst mode.
+        0u64
+    } else {
+        cli.arp_rate_ms
+    };
+    let arp_rate_delay = Duration::from_millis(effective_rate_ms);
+
+    let est_secs = if effective_rate_ms > 0 {
+        format!("~{}s", (scan_targets.len() as u64 * effective_rate_ms) / 1000 + 3)
+    } else {
+        "~3-5s".to_string()
+    };
 
     logger.log(&Event::Info {
         message: &format!(
-            "Sending {} ARP requests (inter-packet delay: {}ms)",
+            "Sending {} ARP requests (delay: {}ms/pkt, est. {})",
             scan_targets.len(),
-            cli.arp_rate_ms,
+            effective_rate_ms,
+            est_secs,
         ),
     });
 
@@ -171,19 +189,15 @@ fn main() {
                 message: &format!("ARP send failed for {}: {}", target_ip, e),
             });
         }
-        // Rate-limit: pause between frames to avoid flooding the network.
-        // At the default of 1 ms this is ~1000 pkts/sec — safe for any
-        // modern LAN yet quiet enough to avoid triggering IDS alerts.
-        // Users can set --arp-rate 0 to restore the original burst behaviour.
-        if cli.arp_rate_ms > 0 {
+        if effective_rate_ms > 0 {
             std::thread::sleep(arp_rate_delay);
         }
     }
 
-    // ── ARP reply collection ──────────────────────────────────────────────────
-    // Collect ARP replies from discovered hosts within the configured timeout
-    // window. Dedup on (IP, MAC) pairs to handle proxy-ARP devices correctly
-    // while filtering duplicate replies from the same host.
+    // ── Collect ARP replies ───────────────────────────────────────────────────
+    // Listen for ARP reply packets and extract device metadata (IP, MAC, vendor).
+    // Deduplication prevents duplicate entries from the same host while allowing
+    // legitimate proxy-ARP entries that report different MACs for the same IP.
     let mut devices: Vec<Device> = Vec::new();
     // Dedup key is (IP, MAC) — a host reporting two different MACs for the
     // same IP (e.g. a proxy-ARP device) gets one entry per unique pair, while
@@ -215,13 +229,13 @@ fn main() {
                             }
                             let oui     = &mac_str[0..8];
 
-                            // Perform vendor lookup using OUI prefix
+                            // Lookup vendor from OUI database.
                             let vendor = oui_db
                                 .get(oui)
                                 .map(|s| s.as_str())
                                 .unwrap_or("Randomized / Spoofed");
 
-                            // Assign risk level based on vendor classification
+                            // Assign risk level based on vendor information.
                             let risk = if vendor == "Randomized / Spoofed" {
                                 "Medium"
                             } else {
@@ -248,13 +262,12 @@ fn main() {
         }
     }
 
-    // Display discovered devices in tabular format
+    // ── Display discovered devices ────────────────────────────────────────────
     print_table(&devices);
 
+    // ── Register signal handler and start monitoring ──────────────────────────
     register_shutdown_handler(shutdown_ctrlc, Arc::clone(&logger));
 
-    // ── Network monitoring phase ──────────────────────────────────────────────
-    // Track discovered hosts for anomaly detection and threat monitoring
     let mut tracked: HashSet<String> = HashSet::new();
     for d in &devices { tracked.insert(d.ip.clone()); }
 
@@ -277,12 +290,13 @@ fn main() {
         });
     }
 
+    // ── Print final session summary ───────────────────────────────────────────
     print_summary(&logger, &stats, session_start);
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Helper Functions ──────────────────────────────────────────────────────────
 
-/// Registers a signal handler for graceful shutdown on Ctrl+C
+/// Registers a Ctrl+C handler to gracefully shutdown the application.
 fn register_shutdown_handler(shutdown: ShutdownFlag, _logger: Arc<Logger>) {
     ctrlc::set_handler(move || {
         println!("\n[!] Ctrl+C received — shutting down...");
@@ -291,7 +305,7 @@ fn register_shutdown_handler(shutdown: ShutdownFlag, _logger: Arc<Logger>) {
     .expect("Failed to register Ctrl+C handler");
 }
 
-/// Prints session summary statistics including duration, host count, and alerts
+/// Prints the final session summary with statistics.
 fn print_summary(
     logger:        &Arc<Logger>,
     stats:         &Arc<monitor::types::SessionStats>,
@@ -308,8 +322,8 @@ fn print_summary(
     });
 }
 
-/// Derives a list of target IP addresses for ARP scanning from network prefix.
-/// Recursively limits large subnets (< /16) to /24 to avoid excessive scanning.
+/// Derives a list of target IPv4 addresses to scan based on the given IP and prefix length.
+/// Automatically limits very large subnets (< /16) to the /24 containing the current host.
 fn derive_scan_targets(ip: Ipv4Addr, prefix: u8) -> Vec<Ipv4Addr> {
     if prefix < 16 {
         println!(
@@ -325,7 +339,7 @@ fn derive_scan_targets(ip: Ipv4Addr, prefix: u8) -> Vec<Ipv4Addr> {
     (1..=host_count).map(|i| Ipv4Addr::from(base + i)).collect()
 }
 
-/// Builds threshold configuration from command-line arguments
+/// Builds a threshold configuration from CLI arguments.
 fn build_thresholds(cli: &Cli) -> Thresholds {
     Thresholds {
         port_scan:     cli.port_scan_threshold,
@@ -335,7 +349,7 @@ fn build_thresholds(cli: &Cli) -> Thresholds {
     }
 }
 
-/// Prints discovered devices in tabular format with columns for IP, MAC, vendor, and risk
+/// Prints a formatted table of discovered devices.
 fn print_table(devices: &[Device]) {
     println!("\nDiscovered Devices:");
     println!("{:<16} {:<20} {:<30} {:<10}", "IP", "MAC", "Vendor", "Risk");
@@ -347,6 +361,7 @@ fn print_table(devices: &[Device]) {
 }
 
 /// Parses the IEEE OUI flat-file database into a prefix→vendor map.
+///
 /// Bug 6 fix: returns `Result` instead of panicking on a missing file.
 fn load_oui_db() -> Result<HashMap<String, String>, String> {
     let data = std::fs::read_to_string("oui.txt")
@@ -364,6 +379,7 @@ fn load_oui_db() -> Result<HashMap<String, String>, String> {
 }
 
 /// Constructs and sends a single ARP request broadcast frame.
+///
 /// Bug 6 fix: returns `Result` so the caller can log send failures.
 /// Previously `tx.send_to()` returned `Option<io::Result<()>>` and the
 /// result was silently discarded.

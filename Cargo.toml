@@ -4,13 +4,32 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
+# Network interface discovery and management
 get_if_addrs  = "0.5"
+
+# Packet construction and manipulation across multiple protocols
 pnet          = "0.34"
+
+# libpcap bindings for packet capture
 pcap          = "1.1"
+
+# Protocol parsing for Ethernet, IPv4, IPv6, TCP, UDP, etc.
 etherparse    = "0.13"
+
+# Command-line argument parsing with derive macros
 clap          = { version = "4", features = ["derive"] }
+
+# Serialization framework with derive support
 serde         = { version = "1", features = ["derive"] }
+
+# JSON serialization/deserialization
 serde_json    = "1"
+
+# Date and time functionality
 chrono        = "0.4"
+
+# Graceful shutdown handling on Ctrl+C signals
 ctrlc         = { version = "3", features = ["termination"] }
-dashmap = "6.1.0"
+
+# Concurrent hashmap for thread-safe data structures
+dashmap       = "6.1.0"
